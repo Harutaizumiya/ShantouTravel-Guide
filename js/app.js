@@ -10,18 +10,23 @@ let state = {
   likedFoods: [], // format: ["潮汕牛肉火锅"]
   customPackingItems: [], // format: [{category: "xxx", name: "xxx", checked: false}]
   checklistState: {}, // format: {"必备证件-0": true}
-  theme: "light"
+  theme: "light",
+  activeView: "itinerary" // "itinerary", "map", "food", "budget", "checklist"
 };
+
+// --- Map State ---
+let map = null;
+let markers = [];
+let polyline = null;
+let activeRouteEndpoint = null; // format: { coords: [lng, lat], name: "xxx" }
+let selectedRouteMode = "transfer"; // "transfer", "riding", "walking", "driving"
+let searchMarker = null;
 
 // --- DOM References ---
 const DOM = {
   themeToggle: document.getElementById("theme-toggle"),
   overallProgressText: document.getElementById("overall-progress-text"),
   overallProgressBar: document.getElementById("overall-progress-bar"),
-  mapNodesGroup: document.getElementById("map-nodes"),
-  mapTooltip: document.getElementById("map-tooltip"),
-  tooltipTitle: document.getElementById("tooltip-title"),
-  tooltipDesc: document.getElementById("tooltip-desc"),
   calcTransport: document.getElementById("calc-transport"),
   calcHotelCity: document.getElementById("calc-hotel-city"),
   calcHotelIsland: document.getElementById("calc-hotel-island"),
@@ -45,7 +50,18 @@ const DOM = {
   checklistCategories: document.getElementById("checklist-categories"),
   customItemName: document.getElementById("custom-item-name"),
   customItemCategory: document.getElementById("custom-item-category"),
-  btnAddItem: document.getElementById("btn-add-item")
+  btnAddItem: document.getElementById("btn-add-item"),
+  
+  // Amap Specific DOM elements
+  mapSearchInput: document.getElementById("map-search-input"),
+  searchResultsPanel: document.getElementById("search-results-panel"),
+  routeStartText: document.getElementById("route-start-text"),
+  routeEndText: document.getElementById("route-end-text"),
+  routeResultInfo: document.getElementById("route-result-info"),
+  modeBtns: document.querySelectorAll(".mode-btn"),
+  
+  // Navigation Links
+  navLinks: document.querySelectorAll(".desktop-nav .nav-link")
 };
 
 // Type to Icon mapper
@@ -60,32 +76,28 @@ const itemIcons = {
 document.addEventListener("DOMContentLoaded", () => {
   loadStateFromLocalStorage();
   initTheme();
+  initAmap();
+  initRouter();
   initEventListeners();
   renderAll();
 });
 
 // --- Local Storage Sync ---
 function loadStateFromLocalStorage() {
-  // Theme
   state.theme = localStorage.getItem("shantou_theme") || "light";
   
-  // Completed Schedule Items
   const completed = localStorage.getItem("shantou_completed_schedule");
   state.completedScheduleItems = completed ? JSON.parse(completed) : [];
   
-  // Liked Foods
   const liked = localStorage.getItem("shantou_liked_foods");
   state.likedFoods = liked ? JSON.parse(liked) : [];
   
-  // Custom Packing Items
   const customItems = localStorage.getItem("shantou_custom_packing");
   state.customPackingItems = customItems ? JSON.parse(customItems) : [];
   
-  // Checklist Checked State
   const chkState = localStorage.getItem("shantou_checklist_state");
   state.checklistState = chkState ? JSON.parse(chkState) : {};
   
-  // Load packing checklist defaults if checklistState is completely empty
   if (Object.keys(state.checklistState).length === 0) {
     travelData.packing.forEach(cat => {
       cat.items.forEach((item, index) => {
@@ -107,6 +119,63 @@ function saveState() {
 function initTheme() {
   document.body.className = `theme-${state.theme}`;
   updateThemeToggleUI();
+  if (map) {
+    map.setTheme(state.theme === "dark" ? "dark" : "normal");
+  }
+}
+
+// --- Router (Multi-view controller) ---
+function initRouter() {
+  window.addEventListener("hashchange", handleRouting);
+  handleRouting(); // run router once on load
+}
+
+function handleRouting() {
+  const hash = window.location.hash || "#/itinerary";
+  const viewName = hash.replace("#/", "");
+  
+  // Set state
+  state.activeView = viewName;
+  
+  // Update view visibility
+  document.querySelectorAll(".page-view").forEach(view => {
+    const viewId = view.getAttribute("id");
+    if (viewId === `view-${viewName}`) {
+      view.classList.add("active");
+    } else {
+      view.classList.remove("active");
+    }
+  });
+  
+  // Update nav links styling
+  DOM.navLinks.forEach(link => {
+    const linkId = link.getAttribute("id");
+    if (linkId === `nav-${viewName}`) {
+      link.classList.add("active");
+    } else {
+      link.classList.remove("active");
+    }
+  });
+  
+  // Scroll to top of the hero section for a clean switch
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  
+  // Amap container resize fix:
+  // If we switch to the map page, high-precision map must recalculate container dimensions since it was hidden
+  if (viewName === "map" && map) {
+    setTimeout(() => {
+      map.resize();
+      
+      // Trigger fitView to ensure markers layout fits perfectly
+      const activeCoords = markers
+        .filter(m => m.dayId === state.currentDay)
+        .map(m => m.coords);
+        
+      if (activeCoords.length > 0 && polyline) {
+        map.setFitView([polyline], false, [60, 60, 60, 60], 13);
+      }
+    }, 100);
+  }
 }
 
 function updateThemeToggleUI() {
@@ -130,10 +199,8 @@ function toggleTheme() {
 
 // --- Event Listeners ---
 function initEventListeners() {
-  // Theme Toggle
   DOM.themeToggle.addEventListener("click", toggleTheme);
   
-  // Day Tab Selectors
   DOM.dayTabBtns.forEach(btn => {
     btn.addEventListener("click", (e) => {
       const dayId = parseInt(e.currentTarget.getAttribute("data-day"));
@@ -141,7 +208,6 @@ function initEventListeners() {
     });
   });
   
-  // Food Filters
   DOM.filterBtns.forEach(btn => {
     btn.addEventListener("click", (e) => {
       DOM.filterBtns.forEach(b => b.classList.remove("active"));
@@ -151,7 +217,6 @@ function initEventListeners() {
     });
   });
   
-  // Budget Calculator Inputs
   [DOM.calcTransport, DOM.calcHotelCity, DOM.calcHotelIsland, DOM.calcIslandTrans].forEach(el => {
     el.addEventListener("change", calculateBudget);
   });
@@ -166,14 +231,56 @@ function initEventListeners() {
     calculateBudget();
   });
   
-  // Packing Item Adder
   DOM.btnAddItem.addEventListener("click", addCustomPackingItem);
   DOM.customItemName.addEventListener("keypress", (e) => {
     if (e.key === "Enter") addCustomPackingItem();
   });
 
-  // Nav highlight scroll listener
-  window.addEventListener("scroll", handleScrollHighlight);
+  // Routing Mode buttons
+  DOM.modeBtns.forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      DOM.modeBtns.forEach(b => b.classList.remove("active"));
+      e.currentTarget.classList.add("active");
+      selectedRouteMode = e.currentTarget.getAttribute("data-mode");
+      if (activeRouteEndpoint) {
+        calculateRoute();
+      }
+    });
+  });
+
+  // Amap Search Autocomplete
+  let auto = null;
+  if (typeof AMap !== 'undefined') {
+    AMap.plugin('AMap.AutoComplete', () => {
+      auto = new AMap.AutoComplete({
+        city: '汕头'
+      });
+    });
+  }
+
+  DOM.mapSearchInput.addEventListener("input", (e) => {
+    const val = e.target.value.trim();
+    if (!val) {
+      DOM.searchResultsPanel.style.display = "none";
+      return;
+    }
+    if (auto) {
+      auto.search(val, (status, result) => {
+        if (status === 'complete' && result.tips) {
+          renderSearchResults(result.tips);
+        } else {
+          DOM.searchResultsPanel.style.display = "none";
+        }
+      });
+    }
+  });
+
+  // Hide search results panel when clicking outside
+  document.addEventListener("click", (e) => {
+    if (!DOM.mapSearchInput.contains(e.target) && !DOM.searchResultsPanel.contains(e.target)) {
+      DOM.searchResultsPanel.style.display = "none";
+    }
+  });
 }
 
 // --- Dynamic Render Operations ---
@@ -192,7 +299,6 @@ function renderDayTimeline() {
   const currentDayData = travelData.days.find(d => d.id === state.currentDay);
   if (!currentDayData) return;
   
-  // Update tabs active state
   DOM.dayTabBtns.forEach(btn => {
     const d = parseInt(btn.getAttribute("data-day"));
     if (d === state.currentDay) {
@@ -202,10 +308,8 @@ function renderDayTimeline() {
     }
   });
   
-  // Summary info
   DOM.daySummaryText.textContent = currentDayData.summary;
   
-  // Schedule Cards
   DOM.timelineList.innerHTML = "";
   currentDayData.schedule.forEach((item, index) => {
     const itemKey = `day${state.currentDay}-${index}`;
@@ -253,7 +357,6 @@ window.toggleScheduleItem = function(itemKey) {
   }
   saveState();
   
-  // Update timeline cards visual state
   const card = document.querySelector(`.timeline-card[data-key="${itemKey}"]`);
   if (card) {
     if (state.completedScheduleItems.includes(itemKey)) {
@@ -266,114 +369,328 @@ window.toggleScheduleItem = function(itemKey) {
   updateProgress();
 };
 
-// 2. SVG Interactive Map Rendering
+// 2. Amap Initialization & Marker Rendering
+function initAmap() {
+  if (typeof AMap === 'undefined') {
+    console.error("Amap SDK not loaded!");
+    return;
+  }
+  
+  map = new AMap.Map("amap-container", {
+    zoom: 11,
+    center: [116.8, 23.4],
+    viewMode: "2D",
+    theme: state.theme === "dark" ? "dark" : "normal"
+  });
+
+  map.on("complete", () => {
+    updateMapHighlight();
+  });
+}
+
 function renderMap() {
-  DOM.mapNodesGroup.innerHTML = "";
+  if (!map) return;
   
-  // Gather all points across all days
-  const allPoints = [];
+  markers.forEach(m => m.instance.setMap(null));
+  markers = [];
+  
   travelData.days.forEach(day => {
-    day.mapPoints.forEach(pt => {
-      // Avoid duplicate points (e.g. station is used in day 1 and 3)
-      if (!allPoints.some(p => p.name === pt.name)) {
-        allPoints.push({
-          ...pt,
-          dayId: day.id
-        });
-      }
+    day.mapPoints.forEach((pt, idx) => {
+      const markerEl = document.createElement("div");
+      markerEl.className = `custom-map-marker node-day-${day.id}`;
+      markerEl.id = `marker-${pt.name.replace(/\s+/g, '')}`;
+      
+      markerEl.innerHTML = `
+        <div class="marker-pin">
+          <span class="marker-inner">${idx + 1}</span>
+        </div>
+        <span class="marker-label">${pt.name}</span>
+      `;
+      
+      const marker = new AMap.Marker({
+        position: pt.coords,
+        content: markerEl,
+        offset: new AMap.Pixel(-12, -36),
+        title: pt.name
+      });
+      
+      const infoContent = document.createElement("div");
+      infoContent.className = "custom-info-card";
+      infoContent.innerHTML = `
+        <h4>${pt.name}</h4>
+        <p>${pt.desc}</p>
+        <button class="info-btn">设为终点</button>
+      `;
+      
+      infoContent.querySelector(".info-btn").addEventListener("click", () => {
+        selectRouteDestination(pt.coords, pt.name);
+        infoWindow.close();
+      });
+      
+      const infoWindow = new AMap.InfoWindow({
+        content: infoContent,
+        isCustom: true,
+        offset: new AMap.Pixel(0, -32)
+      });
+      
+      marker.on("click", () => {
+        map.clearInfoWindow();
+        infoWindow.open(map, pt.coords);
+        
+        if (day.id === state.currentDay) {
+          highlightTimelineCard(pt.name);
+        }
+      });
+      
+      marker.setMap(map);
+      markers.push({
+        instance: marker,
+        dayId: day.id,
+        name: pt.name,
+        coords: pt.coords,
+        element: markerEl
+      });
     });
   });
-  
-  allPoints.forEach(pt => {
-    const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    group.setAttribute("class", `map-node node-day-${pt.dayId}`);
-    group.setAttribute("data-name", pt.name);
-    group.setAttribute("data-desc", pt.desc);
-    group.setAttribute("data-day", pt.dayId);
-    
-    // Add glowing effect background
-    const glow = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    glow.setAttribute("cx", pt.x * 4); // scale up coordinate space
-    glow.setAttribute("cy", pt.y * 3);
-    glow.setAttribute("r", 12);
-    glow.setAttribute("fill", "var(--primary-glow)");
-    glow.setAttribute("opacity", "0");
-    glow.setAttribute("class", "node-glow");
-    
-    // Add core circle
-    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    circle.setAttribute("cx", pt.x * 4);
-    circle.setAttribute("cy", pt.y * 3);
-    circle.setAttribute("r", 7.5);
-    circle.setAttribute("filter", "url(#shadow)");
-    
-    // Add text label
-    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    text.setAttribute("x", pt.x * 4);
-    text.setAttribute("y", (pt.y * 3) - 13);
-    text.setAttribute("text-anchor", "middle");
-    text.textContent = pt.name;
-    
-    group.appendChild(glow);
-    group.appendChild(circle);
-    group.appendChild(text);
-    
-    // Interactive Handlers
-    group.addEventListener("mouseenter", (e) => {
-      showMapTooltip(e, pt.name, pt.desc);
-      glow.setAttribute("opacity", "1");
-    });
-    group.addEventListener("mouseleave", () => {
-      hideMapTooltip();
-      glow.setAttribute("opacity", "0");
-    });
-    group.addEventListener("click", () => {
-      setActiveDay(pt.dayId);
-      // Smooth scroll to itinerary timeline
-      document.getElementById("itinerary").scrollIntoView({ behavior: "smooth" });
-    });
-    
-    DOM.mapNodesGroup.appendChild(group);
-  });
-  
-  updateMapHighlight();
 }
 
 function updateMapHighlight() {
-  const nodes = DOM.mapNodesGroup.querySelectorAll(".map-node");
-  nodes.forEach(node => {
-    const day = parseInt(node.getAttribute("data-day"));
-    if (day === state.currentDay) {
-      node.classList.add("active");
+  if (!map || markers.length === 0) return;
+  
+  clearRoute();
+  if (searchMarker) {
+    searchMarker.setMap(null);
+    searchMarker = null;
+  }
+  DOM.mapSearchInput.value = "";
+  
+  const activeCoords = [];
+  markers.forEach(m => {
+    if (m.dayId === state.currentDay) {
+      m.instance.show();
+      m.element.classList.add("active");
+      activeCoords.push(m.coords);
     } else {
-      node.classList.remove("active");
+      m.instance.hide();
+      m.element.classList.remove("active");
     }
+  });
+  
+  if (polyline) {
+    polyline.setMap(null);
+  }
+  
+  if (activeCoords.length > 0) {
+    polyline = new AMap.Polyline({
+      path: activeCoords,
+      strokeColor: "#0284c7",
+      strokeWeight: 5,
+      strokeOpacity: 0.8,
+      strokeStyle: "dashed",
+      strokeDasharray: [10, 5],
+      lineJoin: "round",
+      lineCap: "round"
+    });
+    polyline.setMap(map);
+    
+    // Zoom & Pan to fit day's destinations (only resize map if activeView is map)
+    if (state.activeView === "map") {
+      map.setFitView([polyline], false, [60, 60, 60, 60], 13);
+    }
+    
+    const firstPt = markers.find(m => m.dayId === state.currentDay);
+    if (firstPt) {
+      DOM.routeStartText.textContent = `起点: ${firstPt.name}`;
+      DOM.routeEndText.textContent = "点击地图标记选择终点";
+    }
+  }
+}
+
+function highlightTimelineCard(name) {
+  // If clicked inside map window, trigger routing tab switch or highlight timeline
+  // Open scheduling tab to show highlighted timeline card
+  window.location.hash = "#/itinerary";
+  
+  setTimeout(() => {
+    const cards = DOM.timelineList.querySelectorAll(".timeline-card");
+    cards.forEach(card => {
+      const title = card.querySelector(".card-title").textContent;
+      const desc = card.querySelector(".card-desc").textContent;
+      const tip = card.querySelector(".card-tip-box").textContent;
+      
+      if (title.includes(name) || desc.includes(name) || tip.includes(name)) {
+        card.style.borderColor = "var(--accent)";
+        card.style.boxShadow = "0 0 15px var(--accent-light)";
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+        
+        setTimeout(() => {
+          card.style.borderColor = "";
+          card.style.boxShadow = "";
+        }, 3000);
+      }
+    });
+  }, 200);
+}
+
+// 3. Search POI Autocomplete panel
+function renderSearchResults(tips) {
+  DOM.searchResultsPanel.innerHTML = "";
+  DOM.searchResultsPanel.style.display = "block";
+  
+  tips.forEach(tip => {
+    if (!tip.location) return;
+    
+    const item = document.createElement("div");
+    item.className = "search-result-item";
+    item.innerHTML = `
+      <h5>${tip.name}</h5>
+      <p>${tip.district || ""} ${tip.address || ""}</p>
+    `;
+    
+    item.addEventListener("click", () => {
+      selectSearchLocation(tip);
+    });
+    
+    DOM.searchResultsPanel.appendChild(item);
   });
 }
 
-function showMapTooltip(e, title, desc) {
-  DOM.tooltipTitle.textContent = title;
-  DOM.tooltipDesc.textContent = desc;
-  DOM.mapTooltip.style.display = "block";
+function selectSearchLocation(tip) {
+  DOM.mapSearchInput.value = tip.name;
+  DOM.searchResultsPanel.style.display = "none";
   
-  // Calculate relative coordinate placement
-  const mapRect = document.getElementById("interactive-map").getBoundingClientRect();
-  const nodeEl = e.currentTarget.querySelector("circle:nth-child(2)");
-  const nodeRect = nodeEl.getBoundingClientRect();
+  const coords = [tip.location.lng, tip.location.lat];
   
-  // Align tooltip above the node
-  const left = (nodeRect.left - mapRect.left) + (nodeRect.width / 2) - 100; // 100 is half width
-  const top = (nodeRect.top - mapRect.top) - 80;
+  if (searchMarker) {
+    searchMarker.setMap(null);
+  }
   
-  DOM.mapTooltip.style.left = `${Math.max(10, Math.min(mapRect.width - 210, left))}px`;
-  DOM.mapTooltip.style.top = `${Math.max(10, top)}px`;
+  searchMarker = new AMap.Marker({
+    position: coords,
+    map: map,
+    animation: "AMAP_ANIMATION_DROP"
+  });
+  
+  map.setZoomAndCenter(15, coords);
+  
+  const infoContent = document.createElement("div");
+  infoContent.className = "custom-info-card";
+  infoContent.innerHTML = `
+    <h4>${tip.name}</h4>
+    <p>${tip.district || ""} ${tip.address || ""}</p>
+    <button class="info-btn">设为终点</button>
+  `;
+  
+  infoContent.querySelector(".info-btn").addEventListener("click", () => {
+    selectRouteDestination(coords, tip.name);
+    infoWindow.close();
+  });
+  
+  const infoWindow = new AMap.InfoWindow({
+    content: infoContent,
+    isCustom: true,
+    offset: new AMap.Pixel(0, -32)
+  });
+  
+  infoWindow.open(map, coords);
+  
+  searchMarker.on("click", () => {
+    infoWindow.open(map, coords);
+  });
 }
 
-function hideMapTooltip() {
-  DOM.mapTooltip.style.display = "none";
+// 4. Intelligent Route Planner logic
+window.selectRouteDestination = function(coords, name) {
+  activeRouteEndpoint = { coords, name };
+  DOM.routeEndText.textContent = `终点: ${name}`;
+  calculateRoute();
+};
+
+function calculateRoute() {
+  if (!map || !activeRouteEndpoint) return;
+  
+  const activeDayMarkers = markers.filter(m => m.dayId === state.currentDay);
+  if (activeDayMarkers.length === 0) return;
+  const startCoords = activeDayMarkers[0].coords;
+  const endCoords = activeRouteEndpoint.coords;
+  
+  clearRoute();
+  
+  DOM.routeResultInfo.style.display = "block";
+  DOM.routeResultInfo.innerHTML = "⌛ 正在规划路线中...";
+  
+  if (polyline) {
+    polyline.setMap(null);
+  }
+  
+  if (selectedRouteMode === "transfer") {
+    AMap.plugin("AMap.Transfer", () => {
+      const transfer = new AMap.Transfer({
+        map: map,
+        city: "汕头市",
+        panel: "route-result-info",
+        policy: AMap.TransferPolicy.LEAST_TIME
+      });
+      window.amapRoutePlugin = transfer;
+      transfer.search(startCoords, endCoords, (status, result) => {
+        if (status !== "complete") {
+          DOM.routeResultInfo.innerHTML = "❌ 未找到合适的跨海/城市公交路线方案，推荐使用驾车或骑行。";
+        }
+      });
+    });
+  } else if (selectedRouteMode === "riding") {
+    AMap.plugin("AMap.Riding", () => {
+      const riding = new AMap.Riding({
+        map: map,
+        panel: "route-result-info"
+      });
+      window.amapRoutePlugin = riding;
+      riding.search(startCoords, endCoords, (status, result) => {
+        if (status !== "complete") {
+          DOM.routeResultInfo.innerHTML = "❌ 骑行规划失败，距离可能过远或无适合非机动车道路。";
+        }
+      });
+    });
+  } else if (selectedRouteMode === "walking") {
+    AMap.plugin("AMap.Walking", () => {
+      const walking = new AMap.Walking({
+        map: map,
+        panel: "route-result-info"
+      });
+      window.amapRoutePlugin = walking;
+      walking.search(startCoords, endCoords, (status, result) => {
+        if (status !== "complete") {
+          DOM.routeResultInfo.innerHTML = "❌ 步行规划失败，距离太远。";
+        }
+      });
+    });
+  } else if (selectedRouteMode === "driving") {
+    AMap.plugin("AMap.Driving", () => {
+      const driving = new AMap.Driving({
+        map: map,
+        panel: "route-result-info",
+        policy: AMap.DrivingPolicy.LEAST_TIME
+      });
+      window.amapRoutePlugin = driving;
+      driving.search(startCoords, endCoords, (status, result) => {
+        if (status !== "complete") {
+          DOM.routeResultInfo.innerHTML = "❌ 驾车路径规划失败。";
+        }
+      });
+    });
+  }
 }
 
-// 3. Food Explorer Rendering
+function clearRoute() {
+  if (window.amapRoutePlugin) {
+    window.amapRoutePlugin.clear();
+    window.amapRoutePlugin = null;
+  }
+  DOM.routeResultInfo.style.display = "none";
+  DOM.routeResultInfo.innerHTML = "";
+}
+
+// 5. Food Explorer Rendering
 function renderFoods(filter = "all") {
   DOM.foodGrid.innerHTML = "";
   
@@ -389,13 +706,12 @@ function renderFoods(filter = "all") {
     const card = document.createElement("div");
     card.className = "food-card";
     
-    // Choose local image if available, else placeholder gradient
-    let imageSrc = "assets/hotpot.png";
-    if (food.name.includes("牛肉火锅")) imageSrc = "assets/hotpot.png";
-    else if (food.name.includes("生腌")) imageSrc = "assets/hotpot.png"; // or custom
-    else if (food.name.includes("灯塔") || food.name.includes("大桥")) imageSrc = "assets/lighthouse.png";
-    else if (food.name.includes("妈屿") || food.name.includes("海观")) imageSrc = "assets/island.png";
-    else imageSrc = "assets/island.png"; // default
+    let imageSrc = "/assets/hotpot.png";
+    if (food.name.includes("牛肉火锅")) imageSrc = "/assets/hotpot.png";
+    else if (food.name.includes("生腌")) imageSrc = "/assets/hotpot.png"; 
+    else if (food.name.includes("灯塔") || food.name.includes("大桥")) imageSrc = "/assets/lighthouse.png";
+    else if (food.name.includes("妈屿") || food.name.includes("海观")) imageSrc = "/assets/island.png";
+    else imageSrc = "/assets/island.png"; // default
     
     card.innerHTML = `
       <div class="food-img-wrapper">
@@ -430,7 +746,6 @@ window.toggleLikeFood = function(e, foodName) {
   }
   saveState();
   
-  // Find button in UI and toggle class
   const btn = e.currentTarget;
   if (btn) {
     btn.classList.toggle("liked");
@@ -439,7 +754,7 @@ window.toggleLikeFood = function(e, foodName) {
   DOM.foodLikedCount.textContent = state.likedFoods.length;
 };
 
-// 4. Budget Calculator
+// 6. Budget Calculator
 function calculateBudget() {
   const trans = parseInt(DOM.calcTransport.value);
   const cityH = parseInt(DOM.calcHotelCity.value);
@@ -448,8 +763,6 @@ function calculateBudget() {
   const islandTrans = parseInt(DOM.calcIslandTrans.value);
   const misc = parseInt(DOM.calcMisc.value);
   
-  // Calculations (3 days, 2 nights total)
-  // 1 night city hotel, 1 night island hotel
   const hotelTotal = cityH + islandH;
   const foodTotal = foodPerDay * 3;
   const transTotal = trans + islandTrans;
@@ -458,7 +771,6 @@ function calculateBudget() {
   
   DOM.budgetTotal.textContent = `￥${grandTotal.toLocaleString()}`;
   
-  // Update Breakdown Graph widths
   const tPercent = Math.max(5, (transTotal / grandTotal) * 100);
   const hPercent = Math.max(5, (hotelTotal / grandTotal) * 100);
   const fPercent = Math.max(5, (foodTotal / grandTotal) * 100);
@@ -475,14 +787,12 @@ function calculateBudget() {
   DOM.breakdownMisc.setAttribute("title", `特产及其他: ￥${misc}`);
 }
 
-// 5. Packing Checklist Rendering
+// 7. Packing Checklist Rendering
 function renderChecklist() {
   DOM.checklistCategories.innerHTML = "";
   
-  // Group all items (default + custom) by category
   const groups = {};
   
-  // Add default groups
   travelData.packing.forEach(cat => {
     groups[cat.category] = [];
     cat.items.forEach((item, index) => {
@@ -496,7 +806,6 @@ function renderChecklist() {
     });
   });
   
-  // Add custom items
   state.customPackingItems.forEach((item, index) => {
     if (!groups[item.category]) {
       groups[item.category] = [];
@@ -511,7 +820,6 @@ function renderChecklist() {
     });
   });
   
-  // Render Categories
   Object.keys(groups).forEach(catName => {
     const items = groups[catName];
     if (items.length === 0) return;
@@ -527,9 +835,7 @@ function renderChecklist() {
         <span>${catName}</span>
         <span class="category-progress-badge">${checkedCount}/${totalCount}</span>
       </div>
-      <div class="check-items-list">
-        <!-- Render Items -->
-      </div>
+      <div class="check-items-list"></div>
     `;
     
     const itemsList = card.querySelector(".check-items-list");
@@ -605,31 +911,25 @@ function addCustomPackingItem() {
   updateProgress();
 }
 
-// 6. Overall Progress Calculation
+// 8. Overall Progress Calculation
 function updateProgress() {
-  // Calculate total items to complete
-  // Total Schedule Items
   let totalSchedule = 0;
   travelData.days.forEach(day => {
     totalSchedule += day.schedule.length;
   });
   
-  // Total default packing items
   let totalPacking = 0;
   travelData.packing.forEach(cat => {
     totalPacking += cat.items.length;
   });
   
-  // Total custom packing items
   totalPacking += state.customPackingItems.length;
   
   const total = totalSchedule + totalPacking;
   
-  // Calculate completed items
   const completedSchedule = state.completedScheduleItems.length;
   
   let completedPacking = 0;
-  // Default packing checklist completion count
   travelData.packing.forEach(cat => {
     cat.items.forEach((item, index) => {
       const key = `${cat.category}-${index}`;
@@ -638,44 +938,13 @@ function updateProgress() {
       }
     });
   });
-  // Custom packing items completion count
   state.customPackingItems.forEach(item => {
     if (item.checked) completedPacking++;
   });
   
   const completed = completedSchedule + completedPacking;
-  
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
   
   DOM.overallProgressText.textContent = `${percent}% (已完成 ${completed}/${total})`;
   DOM.overallProgressBar.style.width = `${percent}%`;
-}
-
-// --- Navigation scroll helper ---
-function handleScrollHighlight() {
-  const sections = ["itinerary", "map-section", "food", "budget", "checklist"];
-  const navLinks = document.querySelectorAll(".nav-link");
-  
-  let currentSectionId = "itinerary";
-  const scrollPosition = window.scrollY + 100; // offset for header
-  
-  sections.forEach(id => {
-    const el = document.getElementById(id);
-    if (el) {
-      const top = el.offsetTop - 50;
-      const bottom = top + el.offsetHeight;
-      if (scrollPosition >= top && scrollPosition < bottom) {
-        currentSectionId = id;
-      }
-    }
-  });
-  
-  navLinks.forEach(link => {
-    const href = link.getAttribute("href").substring(1);
-    if (href === currentSectionId) {
-      link.classList.add("active");
-    } else {
-      link.classList.remove("active");
-    }
-  });
 }
